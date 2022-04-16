@@ -1,4 +1,4 @@
-train_file: '/data1/yx/suda/image-text/data/snli_ve_rebuild/ve_caption_dev.json'
+train_file: '/data1/yx/suda/image-text/data/snli_ve_rebuild/ve_caption_train.json'
 val_file: '/data1/yx/suda/image-text/data/snli_ve_rebuild/ve_caption_dev.json'                
 test_file: '/data1/yx/suda/image-text/data/snli_ve_rebuild/format_annotation.json'
 
@@ -9,7 +9,7 @@ batch_size_train: 16
 batch_size_test: 32 
 
 alpha: 0.4
-distill: True
+distill: False
 warm_up: False
 
 bert_config: 'configs/config_bert.json'

@@ -221,15 +221,16 @@ def main(args, config):
 
                 with open(os.path.join(args.output_dir, "log.txt"),"a") as f:
                     f.write(json.dumps(log_stats) + "\n")
-
-                if float(val_stats['acc'])>best:
-                    save_obj = {
+                save_obj = {
                         'model': model_without_ddp.state_dict(),
                         'optimizer': optimizer.state_dict(),
                         'lr_scheduler': lr_scheduler.state_dict(),
                         'config': config,
                         'epoch': epoch,
                     }
+                torch.save(save_obj, os.path.join(args.output_dir, 'checkpoint-{}.pth'.format(epoch))) 
+                if float(val_stats['acc'])>best:
+                    
                     torch.save(save_obj, os.path.join(args.output_dir, 'checkpoint_best.pth')) 
                     best = float(val_stats['acc'])
                     best_epoch = epoch
