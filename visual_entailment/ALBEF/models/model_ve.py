@@ -1,7 +1,7 @@
 from functools import partial
 from models.vit import VisionTransformer
 from models.xbert import BertConfig, BertModel
-
+from transformers import BertModel as tBert
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -55,6 +55,8 @@ class ALBEF(nn.Module):
             self.momentum = 0.995
 
         # dependent textual entailment model & joint VE+TE model
+        self.te_bert = tBert.from_pretrained(
+            text_encoder, add_pooling_layer=False)
 
         self.textual_cls_head = nn.Sequential(
             nn.Linear(self.text_encoder.config.hidden_size,
@@ -72,30 +74,40 @@ class ALBEF(nn.Module):
 
         self.gate_net = nn.Linear(2*self.text_encoder.config.hidden_size, 2)
 
-    def forward(self, image, text, targets, alpha=0, train=True):
+    def forward(self, image, text, hypo, targets, alpha=0, train=True):
 
         image_embeds = self.visual_encoder(image)
         image_atts = torch.ones(
             image_embeds.size()[:-1], dtype=torch.long).to(image.device)
+        textual_entailment = self.te_bert(text.input_ids,
+                                              attention_mask=text.attention_mask,
+                                              return_dict=True
+                                              )
+        te_hiddens = textual_entailment.last_hidden_state[:, 0, :]
+        prediction_te = self.textual_cls_head(te_hiddens)
 
-        if train:
-
-            textual_entailment = self.text_encoder(text.input_ids,
-                                                   attention_mask=text.attention_mask,
-                                                   return_dict=True
-                                                   )
-            te_hiddens = textual_entailment.last_hidden_state[:, 0, :]
-            prediction_te = self.textual_cls_head(te_hiddens)
-            loss_te = F.cross_entropy(prediction_te, targets)
-
-            output = self.text_encoder(text.input_ids,
-                                       attention_mask=text.attention_mask,
+        output = self.text_encoder(hypo.input_ids,
+                                       attention_mask=hypo.attention_mask,
                                        encoder_hidden_states=image_embeds,
                                        encoder_attention_mask=image_atts,
                                        return_dict=True
                                        )
-            ve_hiddens=output.last_hidden_state[:, 0, :]
-            prediction_ve = self.cls_head(ve_hiddens)
+        ve_hiddens = output.last_hidden_state[:, 0, :]
+        prediction_ve = self.cls_head(ve_hiddens)
+
+        concated_outputs = torch.cat((ve_hiddens, te_hiddens), dim=-1)
+        gated_values = self.gate_net(concated_outputs)
+        gated_values = nn.functional.softmax(gated_values, dim=-1)
+        # B * 2
+        g0 = gated_values[:, 0].unsqueeze(-1)
+        g1 = gated_values[:, 1].unsqueeze(-1)
+        joint_hiddens = g0 * ve_hiddens + g1 * te_hiddens
+        prediction_joint = self.joint_cls_head(joint_hiddens)
+
+        if train:
+
+            loss_te = F.cross_entropy(prediction_te, targets)
+
             if self.distill:
                 with torch.no_grad():
                     self._momentum_update()
@@ -114,27 +126,13 @@ class ALBEF(nn.Module):
             else:
                 loss_ve = F.cross_entropy(prediction_ve, targets)
 
-            concated_outputs = torch.cat((ve_hiddens, te_hiddens), dim=-1)
-            gated_values = self.gate_net(concated_outputs)
-            gated_values = nn.functional.softmax(gated_values, dim=-1)
-            # B * S * 2
-            g0 = gated_values[:,:,0].unsqueeze(-1)
-            g1 = gated_values[:,:,1].unsqueeze(-1)
-            joint_hiddens = g0* ve_hiddens + g1* te_hiddens
-            prediction_joint = self.joint_cls_head(joint_hiddens)
+            
             loss_joint = F.cross_entropy(prediction_joint, targets)
 
-            return loss_ve+loss_te+loss_joint
+            return loss_ve, loss_te, loss_joint
 
         else:
-            output = self.text_encoder(text.input_ids,
-                                       attention_mask=text.attention_mask,
-                                       encoder_hidden_states=image_embeds,
-                                       encoder_attention_mask=image_atts,
-                                       return_dict=True
-                                       )
-            prediction = self.cls_head(output.last_hidden_state[:, 0, :])
-            return prediction
+            return prediction_joint
 
     @torch.no_grad()
     def copy_params(self):

@@ -33,33 +33,37 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
     
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=50, fmt='{value:.6f}'))
-    metric_logger.add_meter('loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-
+    metric_logger.add_meter('loss_ve', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('loss_te', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('loss_joint', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
     header = 'Train Epoch: [{}]'.format(epoch)
     print_freq = 50   
     step_size = 100
     warmup_iterations = warmup_steps*step_size  
  
-    for i,(images, text, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for i,(images, caption, text, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
     
         images, targets = images.to(device,non_blocking=True), targets.to(device,non_blocking=True)
         
-        text_inputs = tokenizer(text, padding='longest', return_tensors="pt").to(device) 
+        text_inputs = tokenizer(list(zip(caption,text)), padding='longest', return_tensors="pt").to(device) 
         
+        hypo_inputs = tokenizer(text, padding='longest', return_tensors="pt").to(device)
+
         if epoch>0 or not config['warm_up']:
             alpha = config['alpha']
         else:
             alpha = config['alpha']*min(1,i/len(data_loader))
 
-        loss = model(images, text_inputs, targets=targets, train=True, alpha=alpha)    
-        
+        loss_ve, loss_te, loss_joint = model(images, text_inputs, hypo_inputs, targets=targets, train=True, alpha=alpha)    
+        loss = loss_te + loss_ve + loss_joint
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()    
                
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-        metric_logger.update(loss=loss.item())
-        
+        metric_logger.update(loss_ve=loss_ve.item())
+        metric_logger.update(loss_te=loss_te.item())
+        metric_logger.update(loss_joint=loss_joint.item())
         if epoch==0 and i%step_size==0 and i<=warmup_iterations: 
             scheduler.step(i//step_size)         
         
@@ -79,13 +83,15 @@ def evaluate(model, data_loader, tokenizer, device, config):
     header = 'Evaluation:'
     print_freq = 50
 
-    for images, text, targets in metric_logger.log_every(data_loader, print_freq, header):
+    for i,(images, caption, text, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    
+        images, targets = images.to(device,non_blocking=True), targets.to(device,non_blocking=True)
         
-        images, targets = images.to(device,non_blocking=True), targets.to(device,non_blocking=True)   
+        text_inputs = tokenizer(list(zip(caption,text)), padding='longest', return_tensors="pt").to(device) 
         
-        text_inputs = tokenizer(text, padding='longest', return_tensors="pt").to(device)  
+        hypo_inputs = tokenizer(text, padding='longest', return_tensors="pt").to(device) 
 
-        prediction = model(images, text_inputs, targets=targets, train=False)  
+        prediction = model(images, text_inputs, hypo_inputs, targets=targets, train=False)  
  
         _, pred_class = prediction.max(1)
         accuracy = (targets==pred_class).sum() / targets.size(0)
@@ -154,6 +160,18 @@ def main(args, config):
         msg = model.load_state_dict(state_dict,strict=False)
         print('load checkpoint from %s'%args.checkpoint)
         print(msg)
+    if args.te_checkpoint:
+        te_check = args.te_checkpoint
+        checkpoint = torch.load(te_check, map_location='cpu')
+        state_dict = checkpoint['model']
+        for key in list(state_dict.keys()):                
+            if 'bert' in key:
+                new_key = key.replace('bert.','')
+                state_dict[new_key] = state_dict[key] 
+                del state_dict[key]
+        msg = model.te_bert.load_state_dict(state_dict,strict=False)
+        print('load checkpoint from %s'%te_check)
+        print(msg)
 
     model = model.to(device)   
     
@@ -174,7 +192,8 @@ def main(args, config):
     
     print("Start training")
     start_time = time.time()
-
+    val_stats = evaluate(model, val_loader, tokenizer, device, config)
+    test_stats = evaluate(model, test_loader, tokenizer, device, config)
     for epoch in range(0, max_epoch):
         if not args.evaluate:
             if args.distributed:
@@ -234,6 +253,7 @@ if __name__ == '__main__':
     parser.add_argument('--config', default='./configs/VE.yaml')
     parser.add_argument('--output_dir', default='output/VE')  
     parser.add_argument('--checkpoint', default='')   
+    parser.add_argument('--te_checkpoint', default='')
     parser.add_argument('--text_encoder', default='bert-base-uncased')
     parser.add_argument('--evaluate', action='store_true')    
     parser.add_argument('--device', default='cuda')
