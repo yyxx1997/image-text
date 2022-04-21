@@ -53,14 +53,21 @@ class re_eval_dataset(Dataset):
         
         txt_id = 0
         for img_id, ann in enumerate(self.ann):
-            self.image.append(ann['image'])
-            self.img2txt[img_id] = []
-            for i, caption in enumerate(ann['caption']):
-                self.origin_text.append(caption)
-                self.text.append(pre_caption(caption,self.max_words))
-                self.img2txt[img_id].append(txt_id)
-                self.txt2img[txt_id] = img_id
-                txt_id += 1
+            image_name=ann['image']
+            if image_name == "unk" or "":
+                for i, caption in enumerate(ann['caption']):
+                    self.text.append(pre_caption(caption,self.max_words))
+                    self.txt2img[txt_id] = -1
+                    txt_id += 1
+            else:
+                self.image.append(image_name)
+                self.img2txt[img_id] = []
+                for i, caption in enumerate(ann['caption']):
+                    self.origin_text.append(caption)
+                    self.text.append(pre_caption(caption,self.max_words))
+                    self.img2txt[img_id].append(txt_id)
+                    self.txt2img[txt_id] = img_id
+                    txt_id += 1
                                     
     def __len__(self):
         return len(self.image)
@@ -222,7 +229,7 @@ def evaluation_only_i2t_rebuild(model, data_loader, tokenizer, device, config):
     print('Computing features for evaluation...')
     print("pid is ", os.getpid())
     model.eval()
-    texts = data_loader.dataset.text_origin
+    texts = data_loader.dataset.origin_text
     num_text = len(texts)
     text_bs = 256
     text_feats = []
@@ -414,7 +421,10 @@ def main(args, config):
     print("Start Evaluating")
     start_time = time.time()
 
-    eval_result,topk_result = evaluation_only_i2t(model_without_ddp, val_loader, tokenizer, device, config)
+    eval_result = evaluation_only_i2t_rebuild(model_without_ddp, val_loader, tokenizer, device, config)
+
+    topk_save_path = '{}/topk_result_{}_{}.jsonl'.format(args.output_dir,config['k_test'],str(os.getpid()))
+    eval_result = evaluation_only_i2t_bigdataset(model_without_ddp, val_loader, tokenizer, device, config , topk_save_path)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -423,9 +433,128 @@ def main(args, config):
     if utils.is_main_process():
         with open(os.path.join(args.output_dir, "log.txt"), "a") as f:
             f.write(str(eval_result)+'\n')
-        with open('{}/topk_result_{}.json'.format(args.output_dir,config['k_test']),'w',encoding="utf8") as file:
-            file.write(json.dumps(topk_result,ensure_ascii=False,indent=4))
 
+@torch.no_grad()
+def evaluation_only_i2t_bigdataset(model, data_loader, tokenizer, device, config, topk_save_path):
+    # get topk entailment texts of image
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    header = 'Get Entailments:'
+    print('Computing features for evaluation...')
+    print("pid is ", os.getpid())
+    model.eval()
+    texts = data_loader.dataset.text
+    origin_texts=data_loader.dataset.origin_text
+    num_text = len(texts)
+    text_bs = 256
+    text_feats = []
+    text_embeds = []
+    text_atts = []
+    for i in tqdm(range(0, num_text, text_bs), desc="Loading text and get text features..."):
+        text = texts[i: min(num_text, i+text_bs)]
+        text_input = tokenizer(text, padding='max_length', truncation=True,
+                               max_length=30, return_tensors="pt").to(device)
+        text_output = model.text_encoder(
+            text_input.input_ids, attention_mask=text_input.attention_mask, mode='text')
+        text_feat = text_output.last_hidden_state
+        text_embed = F.normalize(model.text_proj(text_feat[:, 0, :]))
+        text_embeds.append(text_embed.to('cpu'))
+        text_feats.append(text_feat.to('cpu'))
+        text_atts.append(text_input.attention_mask.to('cpu'))
+    text_embeds = torch.cat(text_embeds, dim=0)
+    text_feats = torch.cat(text_feats, dim=0)
+    text_atts = torch.cat(text_atts, dim=0)
+    print(len(text_embeds))
+
+    image_ids = []
+    img2txt = data_loader.dataset.img2txt
+    total=0
+    offset=0
+    
+    for image, img_id in tqdm(data_loader, desc="Loading image features and get topk similarity..."):
+        image = image.to(device)
+        image_feat = model.visual_encoder(image)
+        image_embed = model.vision_proj(image_feat[:, 0, :])
+        image_embed = F.normalize(image_embed, dim=-1).to('cpu')
+        sims_matrix = image_embed @ text_embeds.t()
+        _, topk_idxs = sims_matrix.topk(k=config['k_test'], dim=-1)
+        bs = img_id.size()[0]
+        score_matrix_i2t = torch.full((bs, len(texts)), -100.0).to(device)
+        for i in range(bs):
+            topk_idx = topk_idxs[i]
+            encoder_output = image_feat[i].repeat(config['k_test'], 1, 1).to(device)
+            encoder_att = torch.ones(encoder_output.size()[:-1], dtype=torch.long).to(device)
+            output = model.text_encoder(encoder_embeds=text_feats[topk_idx].to(device),
+                                        attention_mask=text_atts[topk_idx].to(device),
+                                        encoder_hidden_states=encoder_output,
+                                        encoder_attention_mask=encoder_att,
+                                        return_dict=True,
+                                        mode='fusion'
+                                        )
+            score = model.itm_head(output.last_hidden_state[:, 0, :])[:, 1]
+            score_matrix_i2t[i, topk_idx] = score
+            total+=1
+        image_ids.extend(img_id.tolist())
+        check_entail = config['k_test']
+        scores_i2t = score_matrix_i2t.to('cpu').numpy()
+        #Images->Text
+        result = {}
+        for order in range(bs):
+            contents = []
+            for wait_check in np.argsort(scores_i2t[order])[::-1][:check_entail]:
+                contents.append(int(wait_check))
+            result[image_ids[order+offset]] = contents
+        offset+=bs
+        topk_result = []
+        for image_id, txt_ids in result.items():
+            body={
+                "image":data_loader.dataset.image[image_id],
+                "goldens": [origin_texts[txtid] for txtid in img2txt[image_id]], 
+                "topks": [origin_texts[txtid] for txtid in txt_ids]
+            }
+            topk_result.append(body)
+        if utils.is_main_process():
+            with open(topk_save_path,'a',encoding="utf8") as file:
+                for dct in topk_result:
+                    file.write(json.dumps(dct)+'\n')
+
+    # #Images->Text
+    # pres = np.zeros((len(image_ids), 10))
+    # ranks = np.zeros(len(image_ids))
+    # golden_total=0
+    # for image_id,prediction in result.items():
+    #     # Score
+    #     rank = 1e20
+    #     goldens = img2txt[image_id]
+    #     prediction=np.array(prediction)
+    #     golden_total+=len(goldens)
+    #     for i in goldens:
+    #         tmp = np.where(prediction == i)[0][0]
+    #         if tmp < rank:
+    #             rank = tmp
+    #     ranks[image_id] = rank
+    #     pres[image_id] = np.cumsum(np.in1d(prediction[:10], goldens))
+
+    # # Compute metrics
+
+    # pr5 = 100.0 * np.sum(pres[:, 4]) / golden_total
+    # pr10 = 100.0 * np.sum(pres[:, 9]) / golden_total
+
+    # tr1 = 100.0 * len(np.where(ranks < 1)[0]) / len(ranks)
+    # tr5 = 100.0 * len(np.where(ranks < 5)[0]) / len(ranks)
+    # tr10 = 100.0 * len(np.where(ranks < 10)[0]) / len(ranks)
+    # tr_mean = (tr1 + tr5 + tr10) / 3
+    # pr_mean = (pr5 + pr10)/2
+
+    # eval_result = {'txt_r1': tr1,
+    #                'txt_r5': tr5,
+    #                'txt_r10': tr10,
+    #                'txt_r_mean': tr_mean,
+    #                'txt_pr5': pr5,
+    #                'txt_pr10': pr10,
+    #                'txt_pr_mean': pr_mean,
+    #                }
+
+    return topk_result
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

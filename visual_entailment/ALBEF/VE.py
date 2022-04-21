@@ -151,7 +151,9 @@ def main(args, config):
                 m_pos_embed_reshaped = interpolate_pos_embed(state_dict['visual_encoder_m.pos_embed'],model.visual_encoder_m)   
                 state_dict['visual_encoder_m.pos_embed'] = m_pos_embed_reshaped 
 
-            for key in list(state_dict.keys()):                
+            for key in list(state_dict.keys()):   
+                if 'te_bert' in key:
+                    continue       
                 if 'bert' in key:
                     new_key = key.replace('bert.','')
                     state_dict[new_key] = state_dict[key] 

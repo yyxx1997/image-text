@@ -20,8 +20,10 @@ class ve_dataset(Dataset):
     def __getitem__(self, index):    
         
         ann = self.ann[index]
-        
-        image_path = os.path.join(self.image_root,'%s.jpg'%ann['image'])        
+        if '.jpg' in ann['image']:
+            image_path = os.path.join(self.image_root,ann['image'])
+        else:
+            image_path = os.path.join(self.image_root,'%s.jpg'%ann['image'])        
         image = Image.open(image_path).convert('RGB')   
         image = self.transform(image)          
 

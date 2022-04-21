@@ -1,7 +1,7 @@
 train_file:  ['/SISDC_GPFS/Home_SE/zqcao-suda/yx/image-text/data/ALBEF_data/data/flickr30k_rebuild_train.json']
 val_file: '/SISDC_GPFS/Home_SE/zqcao-suda/yx/image-text/data/ALBEF_data/data/flickr30k_rebuild_val.json'                
-test_file: '/SISDC_GPFS/Home_SE/zqcao-suda/yx/image-text/data/ALBEF_data/data/flickr30k_rebuild_test.json'
-image_root: '/SISDC_GPFS/Home_SE/zqcao-suda/yx/image-text/data/flickr30k/' #flickr30k-images/
+test_file: '/data1/yx/suda/image-text/data/ALBEF/datas/data/flickr30k_format_annotation.json'
+image_root: '/data1/yx/suda/image-text/data/flickr30k/' #flickr30k-images/
 
 bert_config: 'configs/config_bert.json'
 
