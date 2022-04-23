@@ -1,0 +1,17 @@
+train_file:  '/data1/yx/suda/image-text/data/xnli/xnli_train.json'
+val_file: '/data1/yx/suda/image-text/data/xnli/xnli_dev.json'                
+test_file: '/data1/yx/suda/image-text/data/xnli/xnli_test.json'
+
+text_encoder: 'bert-base-uncased'
+class_number: 2
+batch_size_train: 128
+batch_size_test: 256
+warm_up: True
+
+optimizer: {opt: adamW, lr: 1e-5, weight_decay: 0.02} 
+schedular: {sched: cosine, lr: 1e-5, epochs: 10, min_lr: 1e-6, decay_rate: 1, warmup_lr: 1e-5, warmup_epochs: 1, cooldown_epochs: 0}
+
+
+
+
+
