@@ -71,7 +71,7 @@ class Attention(nn.Module):
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x
+        return x, attn
 
 
 class Block(nn.Module):
@@ -89,9 +89,10 @@ class Block(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
     def forward(self, x, register_hook=False):
-        x = x + self.drop_path(self.attn(self.norm1(x), register_hook=register_hook))
+        x_attn, attn = self.attn(self.norm1(x), register_hook=register_hook)
+        x = x + self.drop_path(x_attn)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
-        return x
+        return x, attn
     
     
 class VisionTransformer(nn.Module):
@@ -168,10 +169,10 @@ class VisionTransformer(nn.Module):
         x = self.pos_drop(x)
 
         for i,blk in enumerate(self.blocks):
-            x = blk(x, register_blk==i)
+            x, attn = blk(x, register_blk==i)
         x = self.norm(x)
         
-        return x
+        return x, attn
 
 
 

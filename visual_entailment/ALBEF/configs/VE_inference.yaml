@@ -1,0 +1,22 @@
+test_file: '/data1/yx/suda/image-text/sotas/UNITER/output/itm/flickr_hn_eval_/best_top128_result.json'
+image_root: '/data1/yx/suda/image-text/data/flickr30k/'
+
+image_res: 384
+batch_size_train: 16 
+batch_size_test: 128 
+
+alpha: 0.4
+distill: False
+warm_up: False
+
+bert_config: 'configs/config_bert.json'
+
+optimizer: {opt: adamW, lr: 2e-5, weight_decay: 0.02}
+schedular: {sched: cosine, lr: 2e-5, epochs: 5, min_lr: 1e-6, decay_rate: 1, warmup_lr: 1e-5, warmup_epochs: 1, cooldown_epochs: 0}
+
+
+
+
+
+
+

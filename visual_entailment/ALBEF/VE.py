@@ -77,36 +77,45 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
 def evaluate(model, data_loader, tokenizer, device, config):
     # test
     model.eval()
-            
     metric_logger = utils.MetricLogger(delimiter="  ")
-
     header = 'Evaluation:'
     print_freq = 50
-
+    predictions=[]
+    goldens=[]
     for i,(images, caption, text, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-    
         images, targets = images.to(device,non_blocking=True), targets.to(device,non_blocking=True)
-        
         text_inputs = tokenizer(list(zip(caption,text)), padding='longest', return_tensors="pt").to(device) 
-        
         hypo_inputs = tokenizer(text, padding='longest', return_tensors="pt").to(device) 
-
         prediction = model(images, text_inputs, hypo_inputs, targets=targets, train=False)  
- 
-        _, pred_class = prediction.max(1)
-        accuracy = (targets==pred_class).sum() / targets.size(0)
+        prediction = utils.concat_all_gather(prediction,config['dist']).to('cpu')   
+        targets = utils.concat_all_gather(targets,config['dist']).to('cpu')            
+        predictions.append(prediction)
+        goldens.append(targets)
 
-        metric_logger.meters['acc'].update(accuracy.item(), n=images.size(0))
-                
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger.global_avg())   
-    return {k: "{:.4f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}
+    predictions=torch.cat(predictions)
+    goldens=torch.cat(goldens)
+    _, pred_class = predictions.max(1)
+    accuracy = (goldens==pred_class).sum() / goldens.size(0)
+    precision = goldens[pred_class==1].sum() / (pred_class==1).sum()
+    recall = pred_class[goldens==1].sum() / goldens.sum()
+    F1 = 2 * precision * recall / (precision + recall)
+    print("evaluation dataset size is ", goldens.size(0))
+    print("Averaged stats accuracy:", accuracy)     
+    print("Averaged stats precision:", precision)    
+    print("Averaged stats recall:", recall)
+    print("Averaged stats F1:", F1)
+    eval_result =  {
+        'accuracy': accuracy.item(),
+        'precision':precision.item(),
+        'recall':recall.item(),
+        'F1':F1.item()
+        }  
+    return eval_result
     
     
 def main(args, config):
     utils.init_distributed_mode(args)    
-    
+    config['dist']=args.distributed
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
@@ -194,8 +203,9 @@ def main(args, config):
     
     print("Start training")
     start_time = time.time()
-    val_stats = evaluate(model, val_loader, tokenizer, device, config)
-    test_stats = evaluate(model, test_loader, tokenizer, device, config)
+    if not args.evaluate:
+        val_stats = evaluate(model, val_loader, tokenizer, device, config)
+        test_stats = evaluate(model, test_loader, tokenizer, device, config)
     for epoch in range(0, max_epoch):
         if not args.evaluate:
             if args.distributed:
@@ -231,16 +241,18 @@ def main(args, config):
                         'epoch': epoch,
                     }
                 torch.save(save_obj, os.path.join(args.output_dir, 'checkpoint-{}.pth'.format(epoch))) 
-                if float(val_stats['acc'])>best:
+                if float(val_stats['accuracy'])>best:
                     
                     torch.save(save_obj, os.path.join(args.output_dir, 'checkpoint_best.pth')) 
-                    best = float(val_stats['acc'])
+                    best = float(val_stats['accuracy'])
                     best_epoch = epoch
         
         if args.evaluate:
             break
         lr_scheduler.step(epoch+warmup_steps+1)  
-        dist.barrier()   
+        if utils.is_dist_avail_and_initialized():
+            dist.barrier()     
+        torch.cuda.empty_cache()
                 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

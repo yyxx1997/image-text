@@ -256,3 +256,20 @@ def init_distributed_mode(args):
                                          world_size=args.world_size, rank=args.rank)
     torch.distributed.barrier()
     setup_for_distributed(args.rank == 0)
+
+@torch.no_grad()
+def concat_all_gather(tensor,dist=True):
+    if dist:
+        """
+        Performs all_gather operation on the provided tensors.
+        *** Warning ***: torch.distributed.all_gather has no gradient.
+        """
+        tensors_gather = [torch.ones_like(tensor)
+            for _ in range(torch.distributed.get_world_size())]
+        torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
+
+        output = torch.cat(tensors_gather, dim=0)
+        return output        
+    else :
+        return tensor
+        

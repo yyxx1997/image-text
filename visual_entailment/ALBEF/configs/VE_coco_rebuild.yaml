@@ -1,8 +1,8 @@
-train_file: '/data1/yx/suda/image-text/data/coco_ve_rebuild/coco_rebuild_ve_train.json'
-val_file: '/data1/yx/suda/image-text/data/coco_ve_rebuild/coco_rebuild_ve_dev.json'                
-test_file: '/data1/yx/suda/image-text/data/snli_ve_rebuild/format_annotation_fullpath.json'
+train_file: '/data1/yx/suda/image-text/data/ve_rebuild_data/hybird_train.json'
+val_file: '/data1/yx/suda/image-text/data/ve_rebuild_data/hybird_test.json'                
+test_file: '/data1/yx/suda/image-text/data/annotations/format_annotation_fullpath.json'
 
-image_root: '/data1/yx/suda/image-text/data/coco2014'
+image_root: '/data1/yx/suda/image-text/data/images'
 
 image_res: 384
 batch_size_train: 16 
@@ -15,7 +15,10 @@ warm_up: False
 bert_config: 'configs/config_bert.json'
 
 optimizer: {opt: adamW, lr: 2e-5, weight_decay: 0.02}
-schedular: {sched: cosine, lr: 2e-5, epochs: 10, min_lr: 1e-6, decay_rate: 1, warmup_lr: 1e-5, warmup_epochs: 1, cooldown_epochs: 0}
+schedular: {sched: cosine, lr: 2e-5, epochs: 5, min_lr: 1e-6, decay_rate: 1, warmup_lr: 1e-5, warmup_epochs: 1, cooldown_epochs: 0}
+
+# Data Augment
+mask_patch_rate: 0.5
 
 
 

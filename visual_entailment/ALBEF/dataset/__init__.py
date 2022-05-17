@@ -5,7 +5,7 @@ from PIL import Image
 
 from dataset.caption_dataset import re_train_dataset, re_eval_dataset, pretrain_dataset
 from dataset.nlvr_dataset import nlvr_dataset
-from dataset.ve_dataset import ve_dataset
+from dataset.ve_dataset import ve_dataset,ve_inference_dataset
 from dataset.vqa_dataset import vqa_dataset
 from dataset.grounding_dataset import grounding_dataset
 
@@ -75,7 +75,10 @@ def create_dataset(dataset, config):
             ])         
         train_dataset = grounding_dataset(config['train_file'], train_transform, config['image_root'], mode='train')       
         test_dataset = grounding_dataset(config['test_file'], test_transform, config['image_root'], mode='test')             
-        return train_dataset, test_dataset    
+        return train_dataset, test_dataset  
+    elif dataset=='ve_eval':
+        test_dataset = ve_inference_dataset(config['test_file'], test_transform, config['image_root'])                
+        return test_dataset  
     
 
 def vqa_collate_fn(batch):

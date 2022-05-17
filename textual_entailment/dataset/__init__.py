@@ -4,13 +4,11 @@ from torch.utils.data import DataLoader
 from dataset.te_dataset import te_train_dataset, te_eval_dataset
 
 
-def create_dataset(dataset, config): 
-    
-    if dataset=='te':          
-        train_dataset = te_train_dataset(config['train_file'])
-        val_dataset = te_eval_dataset(config['val_file'])  
-        test_dataset = te_eval_dataset(config['test_file'])                
-        return train_dataset, val_dataset, test_dataset     
+def create_dataset(config): 
+    train_dataset = te_train_dataset(config['train_file'])
+    val_dataset = te_eval_dataset(config['val_file'])  
+    test_dataset = te_eval_dataset(config['test_file'])                
+    return train_dataset, val_dataset, test_dataset     
 
 
 def create_sampler(datasets, shuffles, num_tasks, global_rank):

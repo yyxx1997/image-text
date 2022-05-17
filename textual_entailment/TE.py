@@ -105,7 +105,7 @@ def main(config):
 
     #### Dataset #### 
     print("Creating dataset")
-    train_dataset, val_dataset, test_dataset = create_dataset('te', config)  
+    train_dataset, val_dataset, test_dataset = create_dataset(config)  
 
     if config.distributed:
         num_tasks = utils.get_world_size()
@@ -206,7 +206,8 @@ def main(config):
             break
            
         lr_scheduler.step(epoch+warmup_steps+1)  
-        dist.barrier()     
+        if utils.is_dist_avail_and_initialized():
+            dist.barrier()     
         torch.cuda.empty_cache()
 
     total_time = time.time() - start_time
@@ -233,7 +234,7 @@ def parse_args():
     parser.add_argument('--dist_backend', default='nccl')
     parser.add_argument('--gradient_accumulation_steps', default=1, type=int, help='gradient accumulation for increase batch virtually.')
     parser.add_argument('--local_rank', default=-1, type=int, help='device number of current process.')
-    parser.add_argument('--eval_before_train', default=True, type=bool)
+    parser.add_argument('--eval_before_train', action='store_true')
     args = parser.parse_args()
     return args
             
