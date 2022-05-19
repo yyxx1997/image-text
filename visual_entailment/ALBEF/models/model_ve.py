@@ -17,7 +17,7 @@ class ALBEF(nn.Module):
 
         self.tokenizer = tokenizer
         self.distill = config['distill']
-        self.mask_patch_rate = config['mask_patch_rate'] if 'mask_patch_rate' in config else None
+
         self.visual_encoder = VisionTransformer(
             img_size=config['image_res'], patch_size=16, embed_dim=768, depth=12, num_heads=12,
             mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6))
@@ -74,53 +74,27 @@ class ALBEF(nn.Module):
 
         self.gate_net = nn.Linear(2*self.text_encoder.config.hidden_size, 2)
 
-    def forward(self, image, text, hypo, targets=None, alpha=0, train=True):
-
-        if train:
-            targets_te = targets_ve = targets
-
-            image_embeds, attn = self.visual_encoder(image)
+    def forward(self, image, text, hypo, targets, alpha=0, train=True):
+        if image is not None:
+            image_embeds = self.visual_encoder(image)
             image_atts = torch.ones(
                 image_embeds.size()[:-1], dtype=torch.long).to(image.device)
-
+            output = self.text_encoder(hypo.input_ids,
+                                       attention_mask=hypo.attention_mask,
+                                       encoder_hidden_states=image_embeds,
+                                       encoder_attention_mask=image_atts,
+                                       return_dict=True
+                                       )
+            ve_hiddens = output.last_hidden_state[:, 0, :]
+            prediction_ve = self.cls_head(ve_hiddens)
+        if text is not None:
             textual_entailment = self.te_bert(text.input_ids,
                                                 attention_mask=text.attention_mask,
                                                 return_dict=True
                                                 )
             te_hiddens = textual_entailment.last_hidden_state[:, 0, :]
             prediction_te = self.textual_cls_head(te_hiddens)
-            loss_te = F.cross_entropy(prediction_te, targets_te)
-
-            if self.mask_patch_rate:
-                attn_cls = attn[:,:,0].detach().sum(dim=1)
-                extra_augment = 4
-                entail_pos = torch.where(targets==1)[0][:extra_augment]
-                extra_image_embeds = image_embeds[entail_pos]
-                extra_attn = attn_cls[entail_pos]
-                _, wait_mask_pos = extra_attn.topk(k=int(attn_cls.size(-1)*self.mask_patch_rate))
-                extra_image_atts = torch.ones(extra_image_embeds.size()[:-1], dtype=torch.long).to(image.device)
-                for bs, topks in enumerate(wait_mask_pos):
-                    extra_image_atts[bs][topks]=0
-                extra_targets = torch.zeros(entail_pos.size(0), dtype=torch.long).to(image.device)
-                image_embeds=torch.cat((image_embeds,extra_image_embeds),dim=0)
-                image_atts=torch.cat((image_atts,extra_image_atts),dim=0)
-                extra_hypo_input_ids = hypo.input_ids[entail_pos]
-                extra_hypo_atts = hypo.attention_mask[entail_pos]
-                hypo.input_ids = torch.cat((hypo.input_ids,extra_hypo_input_ids),dim=0)
-                hypo.attention_mask = torch.cat((hypo.attention_mask,extra_hypo_atts),dim=0)
-                targets_ve = torch.cat((targets_ve,extra_targets))
-                te_hiddens = torch.cat((te_hiddens,te_hiddens[entail_pos]),dim=0)
-                
-
-            visual_entailment = self.text_encoder(hypo.input_ids,
-                                        attention_mask=hypo.attention_mask,
-                                        encoder_hidden_states=image_embeds,
-                                        encoder_attention_mask=image_atts,
-                                        return_dict=True
-                                        )
-            ve_hiddens = visual_entailment.last_hidden_state[:, 0, :]
-            prediction_ve = self.cls_head(ve_hiddens)
-
+        if image is not None and text is not None:
             concated_outputs = torch.cat((ve_hiddens, te_hiddens), dim=-1)
             gated_values = self.gate_net(concated_outputs)
             gated_values = nn.functional.softmax(gated_values, dim=-1)
@@ -130,7 +104,9 @@ class ALBEF(nn.Module):
             joint_hiddens = g0 * ve_hiddens + g1 * te_hiddens
             prediction_joint = self.joint_cls_head(joint_hiddens)
 
-            
+        if train:
+
+            loss_te = F.cross_entropy(prediction_te, targets) if text is not None else torch.tensor(0,requires_grad=False)
 
             if self.distill:
                 with torch.no_grad():
@@ -148,40 +124,14 @@ class ALBEF(nn.Module):
                 loss_ve = (1-alpha)*F.cross_entropy(prediction_ve, targets) - alpha*torch.sum(
                     F.log_softmax(prediction_ve, dim=1)*F.softmax(prediction_m, dim=1), dim=1).mean()
             else:
-                loss_ve = F.cross_entropy(prediction_ve, targets_ve)
+                loss_ve = F.cross_entropy(prediction_ve, targets) if image is not None else torch.tensor(0,requires_grad=False)
 
             
-            loss_joint = F.cross_entropy(prediction_joint, targets_ve)
+            loss_joint = F.cross_entropy(prediction_joint, targets) if image is not None and text is not None else torch.tensor(0,requires_grad=False)
 
             return loss_ve, loss_te, loss_joint
 
         else:
-            image_embeds, attn = self.visual_encoder(image)
-            image_atts = torch.ones(
-                image_embeds.size()[:-1], dtype=torch.long).to(image.device)
-
-            textual_entailment = self.te_bert(text.input_ids,
-                                                attention_mask=text.attention_mask,
-                                                return_dict=True
-                                                )
-            te_hiddens = textual_entailment.last_hidden_state[:, 0, :]
-
-            output = self.text_encoder(hypo.input_ids,
-                                       attention_mask=hypo.attention_mask,
-                                       encoder_hidden_states=image_embeds,
-                                       encoder_attention_mask=image_atts,
-                                       return_dict=True
-                                       )
-            ve_hiddens = output.last_hidden_state[:, 0, :]
-
-            concated_outputs = torch.cat((ve_hiddens, te_hiddens), dim=-1)
-            gated_values = self.gate_net(concated_outputs)
-            gated_values = nn.functional.softmax(gated_values, dim=-1)
-            # B * 2
-            g0 = gated_values[:, 0].unsqueeze(-1)
-            g1 = gated_values[:, 1].unsqueeze(-1)
-            joint_hiddens = g0 * ve_hiddens + g1 * te_hiddens
-            prediction_joint = self.joint_cls_head(joint_hiddens)
             return prediction_joint
 
     @torch.no_grad()
