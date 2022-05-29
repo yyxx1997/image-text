@@ -24,25 +24,32 @@ from dataset import create_dataset, create_sampler, create_loader
 from scheduler import create_scheduler
 from optim import create_optimizer
 
+def modi_opt(optimizer, decay_rate):
+    for param_group in optimizer.param_groups:
+        param_group['lr'] *= decay_rate
+
+def restore_opt(optimizer, origin_lr):
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = origin_lr
 
 def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config):
     # train
     model.train()  
     
     metric_logger = utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    metric_logger.add_meter('loss_itm', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
-    metric_logger.add_meter('loss_ita', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.8f}'))
+    metric_logger.add_meter('loss_itm', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('loss_ita', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Train Epoch: [{}]'.format(epoch)
     print_freq = 50
     step_size = 100
     warmup_iterations = warmup_steps*step_size  
     
-    for i,(image, text, idx) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for i,(image, text, idx, gold) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         image = image.to(device,non_blocking=True)   
         idx = idx.to(device,non_blocking=True)   
         text_input = tokenizer(text, padding='longest', max_length=30, return_tensors="pt").to(device)  
-            
+
         if epoch>0 or not config['warm_up']:
             alpha = config['alpha']
         else:
@@ -51,6 +58,10 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
         loss_ita, loss_itm = model(image, text_input,alpha=alpha, idx=idx)                  
         loss = loss_ita + loss_itm
         
+        lr_decay = gold.sum().item()/len(gold)
+        origin_lr = optimizer.param_groups[0]['lr']
+        modi_opt(optimizer,lr_decay)
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()    
@@ -58,6 +69,7 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
         metric_logger.update(loss_itm=loss_itm.item())
         metric_logger.update(loss_ita=loss_ita.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+        restore_opt(optimizer,origin_lr)
         if epoch==0 and i%step_size==0 and i<=warmup_iterations: 
             scheduler.step(i//step_size)         
         
@@ -269,7 +281,7 @@ def main(args, config):
 
     #### Dataset #### 
     print("Creating retrieval dataset")
-    train_dataset, val_dataset, test_dataset = create_dataset('re', config)  
+    train_dataset, val_dataset, test_dataset = create_dataset('re_entail_lr', config)  
 
     if args.distributed:
         num_tasks = utils.get_world_size()
@@ -327,9 +339,11 @@ def main(args, config):
     warmup_steps = config['schedular']['warmup_epochs']
     best = 0
     best_epoch = 0
+
     if args.eval_before_train:
         val_result,val_topk = evaluation(model_without_ddp, val_loader, tokenizer, device, config)
         test_result,test_topk = evaluation(model_without_ddp, test_loader, tokenizer, device, config)
+
     print("Start training")
     start_time = time.time()    
     for epoch in range(0, max_epoch):

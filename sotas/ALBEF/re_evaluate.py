@@ -450,7 +450,7 @@ def evaluation_i2t_for_ve_bigdataset(model, data_loader, tokenizer, device, conf
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Get Entailments:'
     print('Computing features for evaluation...')
-    print("pid is ", os.getpid())
+    print("func is evaluation_i2t_for_ve_bigdataset", os.getpid())
     model.eval()
     texts = data_loader.dataset.text
     origin_texts=data_loader.dataset.origin_text

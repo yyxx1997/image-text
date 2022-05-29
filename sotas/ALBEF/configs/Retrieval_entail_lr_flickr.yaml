@@ -1,8 +1,8 @@
-train_file:  ['/data1/yx/suda/image-text/sotas/ALBEF/datas/data/flickr30k_rebuild_train_extra_entail.json']
-val_file: '/data1/yx/suda/image-text/sotas/ALBEF/datas/data/flickr30k_rebuild_val.json'                
+train_file:  ['/data1/yx/suda/image-text/data/re_rebuild_data/flickr30k_rebuild_train_plus_entail.json']
+val_file: '/data1/yx/suda/image-text/data/re_rebuild_data/flickr30k_rebuild_val.json'                
 test_file: '/data1/yx/suda/image-text/data/annotations/format_annotation_re.json'
-image_root: '/data1/yx/suda/image-text/data/flickr30k/' #flickr30k-images/
-
+image_root: '/data1/yx/suda/image-text/data/images/' #flickr30k-images/
+entailments: '/data1/yx/suda/image-text/data/ALBEF/datas/data/flickr30k_all_after_vete_1k_acc70.json'
 bert_config: 'configs/config_bert.json'
 
 image_res: 384
