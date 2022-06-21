@@ -19,7 +19,7 @@ from models.model_retrieval import ALBEF
 from models.vit import interpolate_pos_embed
 from models.tokenization_bert import BertTokenizer
 import utils
-from dataset import create_loader
+from dataset import create_loader,create_sampler
 from tqdm import tqdm
 from torchvision import transforms
 import json
@@ -50,12 +50,15 @@ class re_eval_dataset(Dataset):
         self.image = []
         self.txt2img = {}
         self.img2txt = {}
-        
+        filter_text = set()
         txt_id = 0
         for img_id, ann in enumerate(self.ann):
             image_name=ann['image']
             if image_name == "unk" or "":
                 for i, caption in enumerate(ann['caption']):
+                    if caption in filter_text:
+                        continue
+                    filter_text.add(caption)
                     self.origin_text.append(caption)
                     self.text.append(pre_caption(caption,self.max_words))
                     self.txt2img[txt_id] = -1
@@ -64,6 +67,9 @@ class re_eval_dataset(Dataset):
                 self.image.append(image_name)
                 self.img2txt[img_id] = []
                 for i, caption in enumerate(ann['caption']):
+                    if caption in filter_text:
+                        continue
+                    filter_text.add(caption)
                     self.origin_text.append(caption)
                     self.text.append(pre_caption(caption,self.max_words))
                     self.img2txt[img_id].append(txt_id)
@@ -80,6 +86,203 @@ class re_eval_dataset(Dataset):
         image = self.transform(image)  
 
         return image, index
+
+
+@torch.no_grad()
+def evaluation(model, data_loader, tokenizer, device, config):
+    # test
+    model.eval() 
+    
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    header = 'Evaluation:'    
+    
+    print('Computing features for evaluation...')
+    start_time = time.time()  
+
+    texts = data_loader.dataset.text
+    images = data_loader.dataset.image
+    origin_texts=data_loader.dataset.origin_text
+    txt2img = data_loader.dataset.txt2img
+    num_text = len(texts)
+    text_bs = 256
+    text_feats = []
+    text_embeds = []  
+    text_atts = []
+    
+    for i in metric_logger.log_every(range(0, num_text, text_bs), 50, "Get text features..."):
+        text = texts[i: min(num_text, i+text_bs)]
+        text_input = tokenizer(text, padding='max_length', truncation=True, max_length=30, return_tensors="pt").to(device) 
+        text_output = model.text_encoder(text_input.input_ids, attention_mask = text_input.attention_mask, mode='text')  
+        text_feat = text_output.last_hidden_state
+        text_embed = F.normalize(model.text_proj(text_feat[:,0,:]))
+        text_embeds.append(text_embed.cpu())   
+        text_feats.append(text_feat.cpu())
+        text_atts.append(text_input.attention_mask.cpu())
+    text_embeds = torch.cat(text_embeds,dim=0)
+    text_feats = torch.cat(text_feats,dim=0)
+    text_atts = torch.cat(text_atts,dim=0)
+    
+    image_feats = []
+    image_embeds = []
+    image_ids = []
+    img2txt = data_loader.dataset.img2txt
+    for image, img_id in metric_logger.log_every(data_loader, 50, "Get image features..."): 
+        image = image.to(device) 
+        image_feat = model.visual_encoder(image)        
+        image_embed = model.vision_proj(image_feat[:,0,:])            
+        image_embed = F.normalize(image_embed,dim=-1)      
+
+        image_feats.append(image_feat.cpu())
+        image_embeds.append(image_embed.cpu())
+        image_ids.extend(img_id.tolist())
+     
+    image_feats = torch.cat(image_feats,dim=0)
+    image_embeds = torch.cat(image_embeds,dim=0)
+    
+    sims_matrix = image_embeds @ text_embeds.t()
+    score_matrix_i2t = torch.full((len(data_loader.dataset.image),len(texts)),-100.0).to(device)
+    score_matrix_t2i = torch.full((len(texts),len(data_loader.dataset.image)),-100.0).to(device)
+
+    num_tasks = utils.get_world_size()
+    rank = utils.get_rank() 
+    step = sims_matrix.size(0)//num_tasks + 1
+    start = rank*step
+    end = min(sims_matrix.size(0),start+step)
+    for i,sims in enumerate(metric_logger.log_every(sims_matrix[start:end], 50, header)): 
+        topk_sim, topk_idx = sims.topk(k=config['k_test'], dim=0)
+
+        encoder_output = image_feats[start+i].repeat(config['k_test'],1,1).to(device)
+        encoder_att = torch.ones(encoder_output.size()[:-1],dtype=torch.long).to(device)
+        output = model.text_encoder(encoder_embeds = text_feats[topk_idx].to(device), 
+                                    attention_mask = text_atts[topk_idx].to(device),
+                                    encoder_hidden_states = encoder_output,
+                                    encoder_attention_mask = encoder_att,                             
+                                    return_dict = True,
+                                    mode = 'fusion'
+                                   )
+        score = model.itm_head(output.last_hidden_state[:,0,:])[:,1]
+        score_matrix_i2t[start+i,topk_idx] = score
+        
+    sims_matrix = sims_matrix.t()
+    step = sims_matrix.size(0)//num_tasks + 1
+    start = rank*step
+    end = min(sims_matrix.size(0),start+step)  
+    for i,sims in enumerate(metric_logger.log_every(sims_matrix[start:end], 50, header)): 
+        
+        topk_sim, topk_idx = sims.topk(k=config['k_test'], dim=0)
+        encoder_output = image_feats[topk_idx].to(device)
+        encoder_att = torch.ones(encoder_output.size()[:-1],dtype=torch.long).to(device)
+        output = model.text_encoder(encoder_embeds = text_feats[start+i].repeat(config['k_test'],1,1).to(device), 
+                                    attention_mask = text_atts[start+i].repeat(config['k_test'],1).to(device),
+                                    encoder_hidden_states = encoder_output,
+                                    encoder_attention_mask = encoder_att,                             
+                                    return_dict = True,
+                                    mode = 'fusion'
+                                   )
+        score = model.itm_head(output.last_hidden_state[:,0,:])[:,1]
+        score_matrix_t2i[start+i,topk_idx] = score
+
+    if args.distributed:
+        dist.barrier()   
+        torch.distributed.all_reduce(score_matrix_i2t, op=torch.distributed.ReduceOp.SUM) 
+        torch.distributed.all_reduce(score_matrix_t2i, op=torch.distributed.ReduceOp.SUM)        
+        
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print('Evaluation time {}'.format(total_time_str)) 
+
+    result = {}
+    topk_upper = config['k_test']
+    scores_i2t = score_matrix_i2t.cpu().numpy()
+    scores_t2i = score_matrix_t2i.cpu().numpy()
+    # Get topk retrieval results of i2t
+    for img in range(scores_i2t.shape[0]):
+        contents = []
+        for wait_check in np.argsort(scores_i2t[img])[::-1][:topk_upper]:
+            contents.append(int(wait_check))
+        result[image_ids[img]] = contents
+
+    topk_result = {}
+    for image_id, txt_ids in result.items():
+        topk_result[data_loader.dataset.image[image_id]] = {
+            "goldens": [origin_texts[txtid] for txtid in img2txt[image_id]], 
+            "topks": [origin_texts[txtid] for txtid in txt_ids]
+            }
+
+    # Get topk retrieval results of t2i
+    result = {}
+    for txt in range(scores_t2i.shape[0]):
+        contents = []
+        for wait_check in np.argsort(scores_t2i[txt])[::-1][:topk_upper]:
+            contents.append(int(wait_check))
+        result[origin_texts[txt]] = contents
+    
+    topk_result_t2i = {}
+    for text, image_ids in result.items():
+        topk_result_t2i[text] = {
+            "topks": [images[imgid] for imgid in image_ids]
+            }
+    # Images->Text
+    pres = np.zeros((scores_i2t.shape[0], 10))
+    ranks = np.zeros(scores_i2t.shape[0])
+    golden_total=0
+    for index, score in enumerate(scores_i2t):
+        inds = np.argsort(score)[::-1]
+        # Score
+        rank = 1e20
+        goldens = img2txt[index]
+        golden_total+=len(goldens)
+        for i in goldens:
+            tmp = np.where(inds == i)[0][0]
+            if tmp < rank:
+                rank = tmp
+        ranks[index] = rank
+        pres[index] = np.cumsum(np.in1d(inds[:10], goldens))
+
+    # Compute metrics
+
+    pr5 = 100.0 * np.sum(pres[:, 4]) / golden_total
+    pr10 = 100.0 * np.sum(pres[:, 9]) / golden_total
+
+    tr1 = 100.0 * len(np.where(ranks < 1)[0]) / len(ranks)
+    tr5 = 100.0 * len(np.where(ranks < 5)[0]) / len(ranks)
+    tr10 = 100.0 * len(np.where(ranks < 10)[0]) / len(ranks)
+
+    # Text->Images 
+    ranks = np.zeros(scores_t2i.shape[0])
+    for index,score in enumerate(scores_t2i):
+        inds = np.argsort(score)[::-1]
+        copes = np.where(inds == txt2img[index])[0]
+        if len(copes) == 0:
+            ranks[index] = 0
+        else:
+            ranks[index] = copes[0]
+
+    # Compute metrics
+    ir1 = 100.0 * len(np.where(ranks < 1)[0]) / len(ranks)
+    ir5 = 100.0 * len(np.where(ranks < 5)[0]) / len(ranks)
+    ir10 = 100.0 * len(np.where(ranks < 10)[0]) / len(ranks)        
+
+    tr_mean = (tr1 + tr5 + tr10) / 3
+    pr_mean = (pr5 + pr10)/2
+    ir_mean = (ir1 + ir5 + ir10) / 3
+    r_mean = (tr_mean + ir_mean) / 2
+
+    eval_result = {'txt_r1': tr1,
+                   'txt_r5': tr5,
+                   'txt_r10': tr10,
+                   'txt_r_mean': tr_mean,
+                   'txt_pr5': pr5,
+                   'txt_pr10': pr10,
+                   'txt_pr_mean': pr_mean,
+                   'img_r1': ir1,
+                   'img_r5': ir5,
+                   'img_r10': ir10,
+                   'img_r_mean': ir_mean,
+                   'r_mean': r_mean
+                   }
+    print("eval_result is:\n",eval_result)
+    return eval_result, topk_result, topk_result_t2i
 
 @torch.no_grad()
 def evaluation_only_i2t(model, data_loader, tokenizer, device, config):
@@ -537,6 +740,7 @@ def main(args, config):
     if args.distributed:
         num_tasks = utils.get_world_size()
         global_rank = utils.get_rank()
+        samplers = create_sampler([val_dataset], [True], num_tasks, global_rank)
     samplers = [None]
     val_loader, = create_loader([val_dataset], samplers,
                                batch_size=[config['batch_size_test']],
@@ -585,7 +789,7 @@ def main(args, config):
     print("Start Evaluating")
     start_time = time.time()
 
-    eval_result, topk_result = evaluation_only_i2t_rebuild(model_without_ddp, val_loader, tokenizer, device, config)
+    eval_result, topk_result, topk_result_t2i = evaluation(model_without_ddp, val_loader, tokenizer, device, config)
 
     # topk_save_path = '{}/topk_result_{}_{}.jsonl'.format(args.output_dir,config['k_test'],str(os.getpid()))
     # eval_result = evaluation_only_i2t_bigdataset(model_without_ddp, val_loader, tokenizer, device, config , topk_save_path)
@@ -598,17 +802,21 @@ def main(args, config):
     print('Evaluating time {}'.format(total_time_str))
 
     if utils.is_main_process():
-        if eval_result:
-            with open(os.path.join(args.output_dir, "log.txt"), "a") as f:
-                f.write(str(eval_result)+'\n')
-        if topk_result:
-            with open(os.path.join(args.output_dir, "top{}_result.json".format(config['k_test'])), "w") as f:
-                f.write(json.dumps(topk_result,ensure_ascii=False,indent=4))
+
+        with open(os.path.join(args.output_dir, "log.txt"), "a") as f:
+            f.write(str(eval_result)+'\n')
+
+        with open(os.path.join(args.output_dir, "top{}_result.json".format(config['k_test'])), "w") as f:
+            f.write(json.dumps(topk_result,ensure_ascii=False,indent=4))
+
+        with open(os.path.join(args.output_dir, "top{}_result_t2i.json".format(config['k_test'])), "w") as f:
+            f.write(json.dumps(topk_result_t2i,ensure_ascii=False,indent=4))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='./configs/Retrieval_flickr.yaml')
     parser.add_argument('--output_dir', default='output/Retrieval_flickr')
+    parser.add_argument('--test_file', default=False)
     parser.add_argument('--checkpoint', default='')
     parser.add_argument('--text_encoder', default='bert-base-uncased')
     parser.add_argument('--evaluate', action='store_true')
@@ -627,5 +835,6 @@ if __name__ == '__main__':
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     yaml.dump(config, open(os.path.join(args.output_dir, 'config.yaml'), 'w'))
-
+    if args.test_file:
+        config['test_file']=args.test_file
     main(args, config)

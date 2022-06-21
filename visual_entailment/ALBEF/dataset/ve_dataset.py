@@ -20,17 +20,22 @@ class ve_dataset(Dataset):
     def __getitem__(self, index):    
         
         ann = self.ann[index]
-        if '.jpg' in ann['image']:
-            image_path = os.path.join(self.image_root,ann['image'])
+        mode = 0
+        if "image" in ann.keys():
+            image_path = os.path.join(self.image_root,ann['image'])  
         else:
-            image_path = os.path.join(self.image_root,'%s.jpg'%ann['image'])        
+            image_path = os.path.join(self.image_root,'empty.jpg')   
+            mode += 1
         image = Image.open(image_path).convert('RGB')   
-        image = self.transform(image)          
-
-        captions = '[SEP]'.join([pre_caption(caption, self.max_words) for caption in ann['caption']])
+        image = self.transform(image)   
+        if "caption" in ann.keys():
+            captions = '[SEP]'.join([pre_caption(caption, self.max_words) for caption in ann['caption']])
+        else:
+            captions = ""
+            mode += 2
         sentence = pre_caption(ann['sentence'], self.max_words)
 
-        return image, captions, sentence, self.labels[ann['label']]
+        return image, captions, sentence, self.labels[ann['label']], mode
 
 class ve_inference_dataset(Dataset):
     def __init__(self, ann_file, transform, image_root, max_words=30):        

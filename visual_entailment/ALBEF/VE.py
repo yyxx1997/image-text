@@ -41,7 +41,7 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
     step_size = 100
     warmup_iterations = warmup_steps*step_size  
  
-    for i,(images, caption, text, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for i,(images, caption, text, targets, mode) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
     
         images, targets = images.to(device,non_blocking=True), targets.to(device,non_blocking=True)
         
@@ -54,7 +54,7 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
         else:
             alpha = config['alpha']*min(1,i/len(data_loader))
 
-        loss_ve, loss_te, loss_joint = model(images, text_inputs, hypo_inputs, targets=targets, train=True, alpha=alpha)    
+        loss_ve, loss_te, loss_joint = model(images, text_inputs, hypo_inputs, targets=targets, mode=mode, train=True, alpha=alpha)    
         loss = loss_te + loss_ve + loss_joint
         optimizer.zero_grad()
         loss.backward()
@@ -82,7 +82,7 @@ def evaluate(model, data_loader, tokenizer, device, config):
     print_freq = 50
     predictions=[]
     goldens=[]
-    for i,(images, caption, text, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for i,(images, caption, text, targets, mode) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         images, targets = images.to(device,non_blocking=True), targets.to(device,non_blocking=True)
         text_inputs = tokenizer(list(zip(caption,text)), padding='longest', return_tensors="pt").to(device) 
         hypo_inputs = tokenizer(text, padding='longest', return_tensors="pt").to(device) 
@@ -96,9 +96,9 @@ def evaluate(model, data_loader, tokenizer, device, config):
     goldens=torch.cat(goldens)
     _, pred_class = predictions.max(1)
     accuracy = (goldens==pred_class).sum() / goldens.size(0)
-    precision = goldens[pred_class==1].sum() / (pred_class==1).sum()
+    precision = goldens[pred_class==1].sum() / ((pred_class==1).sum() + 1e-8)
     recall = pred_class[goldens==1].sum() / goldens.sum()
-    F1 = 2 * precision * recall / (precision + recall)
+    F1 = 2 * precision * recall / (precision + recall + 1e-8)
     print("evaluation dataset size is ", goldens.size(0))
     print("Averaged stats accuracy:", accuracy)     
     print("Averaged stats precision:", precision)    
@@ -203,7 +203,7 @@ def main(args, config):
     
     print("Start training")
     start_time = time.time()
-    if not args.evaluate:
+    if args.eval_before_train:
         val_stats = evaluate(model, val_loader, tokenizer, device, config)
         test_stats = evaluate(model, test_loader, tokenizer, device, config)
     for epoch in range(0, max_epoch):
@@ -276,6 +276,7 @@ if __name__ == '__main__':
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')    
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     parser.add_argument('--distributed', default=True, type=bool)
+    parser.add_argument('--eval_before_train', action='store_true')
     args = parser.parse_args()
 
     config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
