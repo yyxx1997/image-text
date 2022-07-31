@@ -1,5 +1,6 @@
 import argparse
 import os
+from regex import P
 import ruamel.yaml as yaml
 import numpy as np
 import random
@@ -26,8 +27,7 @@ from dataset import create_dataset, create_sampler, create_loader
 from scheduler import create_scheduler
 from optim import create_optimizer
 
-
-def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config):
+def train(model, data_loader, optimizer, val_loader, test_loader,tokenizer, epoch, warmup_steps, device, scheduler, config, args, best):
     # train
     model.train()  
     
@@ -39,13 +39,15 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
     header = 'Train Epoch: [{}]'.format(epoch)
     print_freq = 50   
     step_size = 100
-    warmup_iterations = warmup_steps*step_size  
- 
-    for i,(images, caption, text, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-    
-        images, targets = images.to(device,non_blocking=True), targets.to(device,non_blocking=True)
-        
-        text_inputs = tokenizer(list(zip(caption,text)), padding='longest', return_tensors="pt").to(device) 
+    warmup_iterations = warmup_steps*step_size
+    num = 0   
+    for i,(images, caption, text, targets,image_bool,text_bool) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        images= images.to(device,non_blocking=True)
+        targets = targets.to(device,non_blocking=True)
+        if caption is not None:
+            text_inputs = tokenizer(list(zip(caption,text)), padding='longest', return_tensors="pt").to(device)
+        else:
+            text_inputs = None 
         
         hypo_inputs = tokenizer(text, padding='longest', return_tensors="pt").to(device)
 
@@ -54,7 +56,7 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
         else:
             alpha = config['alpha']*min(1,i/len(data_loader))
 
-        loss_ve, loss_te, loss_joint = model(images, text_inputs, hypo_inputs, targets=targets, train=True, alpha=alpha)    
+        loss_ve, loss_te, loss_joint = model(images, text_inputs, hypo_inputs, targets=targets, train=True, alpha=alpha,image_bool=image_bool,text_bool=text_bool)    
         loss = loss_te + loss_ve + loss_joint
         optimizer.zero_grad()
         loss.backward()
@@ -65,13 +67,38 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
         metric_logger.update(loss_te=loss_te.item())
         metric_logger.update(loss_joint=loss_joint.item())
         if epoch==0 and i%step_size==0 and i<=warmup_iterations: 
-            scheduler.step(i//step_size)         
+            scheduler.step(i//step_size)
+        num+=1
+        if num % 500 ==0:
+            val_stats = evaluate(model, val_loader, tokenizer, device, config)
+            test_stats = evaluate(model, test_loader, tokenizer, device, config)
+
+            if utils.is_main_process():  
+                    log_stats = {**{f'val_{k}': v for k, v in val_stats.items()},
+                                **{f'test_{k}': v for k, v in test_stats.items()},
+                                'epoch': epoch,
+                                }
+
+                    with open(os.path.join(args.output_dir, "log.txt"),"a") as f:
+                        f.write(json.dumps(log_stats) + "\n")                
+                    save_obj = {
+                            'model': model.module.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'lr_scheduler': scheduler.state_dict(),
+                            'config': config,
+                            'epoch': epoch,
+                        }
+                    #torch.save(save_obj, os.path.join(args.output_dir, 'checkpoint-{}.pth'.format(epoch))) 
+                    if float(val_stats['accuracy'])>best:
+                        
+                        torch.save(save_obj, os.path.join(args.output_dir, 'checkpoint_best.pth')) 
+                        best = float(val_stats['accuracy'])
+                        # best_epoch = epoch
         
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger.global_avg())     
-    return {k: "{:.4f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}    
-
+    return {k: "{:.4f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}, best    
 
 @torch.no_grad()
 def evaluate(model, data_loader, tokenizer, device, config):
@@ -82,11 +109,11 @@ def evaluate(model, data_loader, tokenizer, device, config):
     print_freq = 50
     predictions=[]
     goldens=[]
-    for i,(images, caption, text, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        images, targets = images.to(device,non_blocking=True), targets.to(device,non_blocking=True)
-        text_inputs = tokenizer(list(zip(caption,text)), padding='longest', return_tensors="pt").to(device) 
+    for i,(images, caption, text, targets,image_bool,text_bool) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        images, targets = images.to(device,non_blocking=True), targets.to(device,non_blocking=True)     
+        text_inputs = tokenizer(list(zip(caption,text)), padding='longest', return_tensors="pt").to(device)       
         hypo_inputs = tokenizer(text, padding='longest', return_tensors="pt").to(device) 
-        prediction = model(images, text_inputs, hypo_inputs, targets=targets, train=False)  
+        prediction = model(images, text_inputs, hypo_inputs, targets=targets, train=False,image_bool=image_bool,text_bool=text_bool)  
         prediction = utils.concat_all_gather(prediction,config['dist']).to('cpu')   
         targets = utils.concat_all_gather(targets,config['dist']).to('cpu')            
         predictions.append(prediction)
@@ -109,9 +136,9 @@ def evaluate(model, data_loader, tokenizer, device, config):
         'precision':precision.item(),
         'recall':recall.item(),
         'F1':F1.item()
-        }  
+        }
+    print("Averaged stats: acc", eval_result["accuracy"])     
     return eval_result
-    
     
 def main(args, config):
     utils.init_distributed_mode(args)    
@@ -188,14 +215,16 @@ def main(args, config):
     
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu],find_unused_parameters=True)
+        # model = model.module
         model_without_ddp = model.module    
     
     arg_opt = utils.AttrDict(config['optimizer'])
     optimizer = create_optimizer(arg_opt, model)
     arg_sche = utils.AttrDict(config['schedular'])
     lr_scheduler, _ = create_scheduler(arg_sche, optimizer)  
-    
+    # optimizer.load_state_dict(checkpoint['optimizer'])
+    # lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
     max_epoch = config['schedular']['epochs']
     warmup_steps = config['schedular']['warmup_epochs']
     best = 0
@@ -203,14 +232,13 @@ def main(args, config):
     
     print("Start training")
     start_time = time.time()
-    if not args.evaluate:
-        val_stats = evaluate(model, val_loader, tokenizer, device, config)
-        test_stats = evaluate(model, test_loader, tokenizer, device, config)
+    val_stats = evaluate(model, val_loader, tokenizer, device, config)
+    # test_stats = evaluate(model, test_loader, tokenizer, device, config)
     for epoch in range(0, max_epoch):
         if not args.evaluate:
             if args.distributed:
                 train_loader.sampler.set_epoch(epoch)
-            train_stats = train(model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config)  
+            train_stats,best = train(model, train_loader, optimizer,val_loader,test_loader,tokenizer, epoch, warmup_steps, device, lr_scheduler, config, args, best)  
             
         val_stats = evaluate(model, val_loader, tokenizer, device, config)
         test_stats = evaluate(model, test_loader, tokenizer, device, config)
@@ -250,9 +278,7 @@ def main(args, config):
         if args.evaluate:
             break
         lr_scheduler.step(epoch+warmup_steps+1)  
-        if utils.is_dist_avail_and_initialized():
-            dist.barrier()     
-        torch.cuda.empty_cache()
+        dist.barrier()   
                 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -265,17 +291,17 @@ def main(args, config):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default='./configs/VE.yaml')
+    parser.add_argument('--config', default='/data1/ach/image-text/visual_entailment/ALBEF/configs/debug.yaml')
     parser.add_argument('--output_dir', default='output/VE')  
-    parser.add_argument('--checkpoint', default='')   
+    parser.add_argument('--checkpoint', default='/data1/ach/project/ALBEF/output/pre.pth')   
     parser.add_argument('--te_checkpoint', default='')
-    parser.add_argument('--text_encoder', default='bert-base-uncased')
+    parser.add_argument('--text_encoder', default='/data1/ach/bert-base-uncased')
     parser.add_argument('--evaluate', action='store_true')    
-    parser.add_argument('--device', default='cuda')
+    parser.add_argument('--device', default='cuda:6')
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')    
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
-    parser.add_argument('--distributed', default=True, type=bool)
+    parser.add_argument('--distributed', default=False, type=bool)
     args = parser.parse_args()
 
     config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
