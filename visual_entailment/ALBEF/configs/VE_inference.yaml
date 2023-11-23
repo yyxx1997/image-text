@@ -1,5 +1,5 @@
-test_file: '/data1/yx/suda/image-text/image-text/sotas/ALBEF/output/Retrieval_flickr_debug/top128_result.json'
-image_root: '/data1/yx/suda/image-text/data/coco2014'
+test_file: '/data1/yx/suda/image-text/image-text/sotas/ALBEF/output/Retrieval_flickr_eval/top64_result.json'
+image_root: '/data1/yx/suda/image-text/data/images/coco2014'
 
 image_res: 384
 batch_size_train: 16 

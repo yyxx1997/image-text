@@ -1,8 +1,8 @@
-train_file:  ['/data1/yx/suda/image-text/data/re_rebuild_data/coco_rebuild_train.json']
-val_file: '/data1/yx/suda/image-text/data/re_rebuild_data/coco_5k_test.json'                
-test_file: '/data1/yx/suda/image-text/data/annotations/format_annotation_re_coco.json'
+train_file:  ['/data1/yx/suda/image-text/data/re_data/coco_train.json']
+val_file: '/data1/yx/suda/image-text/data/re_data/coco_5k_test.json'                
+test_file: '/data1/yx/suda/image-text/data/re_data/coco_5k_test_entailed.json'
 image_root: '/data1/yx/suda/image-text/data/images'
-
+entailments: '/data1/yx/suda/image-text/data/ALBEF/datas/data/coco_after_llm.json'
 bert_config: 'configs/config_bert.json'
 
 image_res: 384
@@ -14,7 +14,7 @@ momentum: 0.995
 vision_width: 768
 embed_dim: 256
 temp: 0.07
-k_test: 128
+k_test: 16
 
 alpha: 0.4
 distill: True
@@ -22,10 +22,3 @@ warm_up: True
 
 optimizer: {opt: adamW, lr: 1e-5, weight_decay: 0.02}
 schedular: {sched: cosine, lr: 1e-5, epochs: 5, min_lr: 1e-6, decay_rate: 1, warmup_lr: 1e-5, warmup_epochs: 1, cooldown_epochs: 0}
-
-
-
-
-
-
-

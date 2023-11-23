@@ -58,32 +58,31 @@ class re_eval_dataset(Dataset):
         self.image = []
         self.txt2img = {}
         self.img2txt = {}
-        
-        txt_id = 0
+        cnt = 0 
         for img_id, ann in enumerate(self.ann):
             image_name=ann['image']
-            if image_name == "unk" or "":
-                for i, caption in enumerate(ann['caption']):
+            self.image.append(image_name)
+            self.img2txt[img_id] = set()
+            for caption in ann['caption']:
+                caption_clean = pre_caption(caption, self.max_words)
+                if caption_clean not in self.text:
+                    self.txt2img[cnt] = set()
+                    txt_id = cnt
+                    self.text.append(caption_clean)
                     self.origin_text.append(caption)
-                    self.text.append(pre_caption(caption,self.max_words))
-                    self.txt2img[txt_id] = -1
-                    txt_id += 1
-            else:
-                self.image.append(image_name)
-                self.img2txt[img_id] = []
-                for i, caption in enumerate(ann['caption']):
-                    self.origin_text.append(caption)
-                    self.text.append(pre_caption(caption,self.max_words))
-                    self.img2txt[img_id].append(txt_id)
-                    self.txt2img[txt_id] = img_id
-                    txt_id += 1
+                    cnt += 1
+                else:
+                    txt_id = self.text.index(caption_clean)
+                self.img2txt[img_id].add(txt_id)
+                self.txt2img[txt_id].add(img_id)  
                                     
     def __len__(self):
         return len(self.image)
     
     def __getitem__(self, index):    
-        
-        image_path = os.path.join(self.image_root, self.ann[index]['image'])        
+
+        image_name = self.image[index]
+        image_path = os.path.join(self.image_root, image_name)        
         image = Image.open(image_path).convert('RGB')    
         image = self.transform(image)  
 
@@ -214,7 +213,6 @@ class re_entail_lr_split_train_dataset(Dataset):
             self.ann += json.load(open(f,'r'))
         self.entailments = json.load(open(entailments,'r'))
         self.img2txt_entail = {}
-        self.txt2img_entail = {}
         self.goldens = {}
         for image_path, dct in self.entailments.items():
             goldens = dct['goldens']
@@ -222,12 +220,6 @@ class re_entail_lr_split_train_dataset(Dataset):
             entailments = dct['entailments']
             if entailments:
                 self.img2txt_entail[image_path] = entailments
-            for txt in goldens:
-                txt = pre_caption(txt,max_words=512)
-                self.txt2img_entail[txt] = self.txt2img_entail.get(txt,[])+[image_path]
-            for txt in entailments:
-                txt = pre_caption(txt,max_words=512)
-                self.txt2img_entail[txt] = self.txt2img_entail.get(txt,[])+[image_path]  
         self.transform = transform
         self.image_root = image_root
         self.max_words = max_words
@@ -239,6 +231,7 @@ class re_entail_lr_split_train_dataset(Dataset):
             if img_id not in self.img_ids.keys():
                 self.img_ids[img_id] = n
                 n += 1    
+        ...
         
     def __len__(self):
         return len(self.ann)
@@ -259,6 +252,6 @@ class re_entail_lr_split_train_dataset(Dataset):
             random_entail = random.sample(self.goldens[image_name],1)[0]
         else:
             random_entail = caption
-        gold = ann['gold']
-
-        return image, caption, self.img_ids[ann['image_id']], random_entail, gold
+        random_entail = pre_caption(random_entail, self.max_words)
+        idx = self.img_ids[ann['image_id']]
+        return image, caption, idx, random_entail

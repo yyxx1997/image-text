@@ -33,8 +33,11 @@ def evaluate_entail_rate(model, data_loader, tokenizer, device, config):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Evaluation:'
     print_freq = 50
+
+    img2txt = data_loader.dataset.img2txt
     predictions = []
     image_id_total = []
+    text_id_total = []
     for i, (images, caption, text, image_ids, text_ids) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         images = images.to(device, non_blocking=True)
         image_ids = image_ids.to(device, non_blocking=True)
@@ -45,14 +48,16 @@ def evaluate_entail_rate(model, data_loader, tokenizer, device, config):
 
         prediction = utils.concat_all_gather(prediction, config['dist']).to('cpu')
         image_ids = utils.concat_all_gather(image_ids, config['dist']).to('cpu')
+        text_ids = utils.concat_all_gather(text_ids, config['dist']).to('cpu')
 
         predictions.append(prediction)
         image_id_total.append(image_ids)
+        text_id_total.append(text_ids)
     
-    img2txt = data_loader.dataset.img2txt
     predictions = torch.cat(predictions)
     _, pred_class = predictions.max(1)
     image_id_total = torch.cat(image_id_total)
+    text_id_total = torch.cat(text_id_total)
 
     t10 = 0
     t30 = 0 
@@ -61,7 +66,9 @@ def evaluate_entail_rate(model, data_loader, tokenizer, device, config):
     total = 0
     for img_id in img2txt.keys():
         idx = torch.where(image_id_total == img_id)[0]
+        _, order = text_id_total[idx].sort()
         pred_image_id = pred_class[idx]
+        pred_image_id = pred_image_id[order]
         topk_entail_number = torch.cumsum(pred_image_id,dim=-1)
         t10 += topk_entail_number[9].item()
         t30 += topk_entail_number[29].item()
@@ -127,6 +134,7 @@ def evaluate_infer(model, data_loader, tokenizer, device, config):
         if image not in entailments.keys():
             entailments[image]={
                 "goldens":data_loader.dataset.wait_infer[image]['goldens'],
+                "topks":data_loader.dataset.wait_infer[image]['topks'],
                 "entailments":[]
             }
         else:
@@ -201,18 +209,6 @@ def main(args, config):
         msg = model.load_state_dict(state_dict, strict=False)
         print('load checkpoint from %s' % args.checkpoint)
         print(msg)
-    if args.te_checkpoint:
-        te_check = args.te_checkpoint
-        checkpoint = torch.load(te_check, map_location='cpu')
-        state_dict = checkpoint['model']
-        for key in list(state_dict.keys()):
-            if 'bert' in key:
-                new_key = key.replace('bert.', '')
-                state_dict[new_key] = state_dict[key]
-                del state_dict[key]
-        msg = model.te_bert.load_state_dict(state_dict, strict=False)
-        print('load checkpoint from %s' % te_check)
-        print(msg)
 
     model = model.to(device)
 
@@ -227,7 +223,7 @@ def main(args, config):
         result = evaluate_infer(model, test_loader, tokenizer, device, config)
 
     if utils.is_main_process():
-        with open(os.path.join(args.output_dir, "result.txt"), "w",encoding="utf8") as f:
+        with open(os.path.join(args.output_dir, "result.json"), "w",encoding="utf8") as f:
             f.write(json.dumps(result,ensure_ascii=False,indent=4))
 
 
@@ -235,6 +231,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='./configs/VE.yaml')
     parser.add_argument('--output_dir', default='output/VE')
+    parser.add_argument('--test_file', default=False)
     parser.add_argument('--checkpoint', default='')
     parser.add_argument('--te_checkpoint', default='')
     parser.add_argument('--text_encoder', default='bert-base-uncased')
@@ -253,5 +250,6 @@ if __name__ == '__main__':
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     yaml.dump(config, open(os.path.join(args.output_dir, 'config.yaml'), 'w'))
-
+    if args.test_file:
+        config['test_file']=args.test_file
     main(args, config)

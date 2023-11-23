@@ -28,28 +28,29 @@ def modi_opt(optimizer, decay_rate):
     for param_group in optimizer.param_groups:
         param_group['lr'] *= decay_rate
 
-def restore_opt(optimizer, origin_lr):
+def reset_opt(optimizer, origin_lr):
     for param_group in optimizer.param_groups:
         param_group['lr'] = origin_lr
 
-def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config):
+def train(model, data_loader, optimizer, tokenizer, epoch, device, scheduler, config):
     # train
     model.train()  
     
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.8f}'))
-    metric_logger.add_meter('loss_origin', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    metric_logger.add_meter('loss_entail', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('lr_low', utils.SmoothedValue(window_size=1, fmt='{value:.8f}'))
+    metric_logger.add_meter('loss_origin', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('loss_entail', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
     header = 'Train Epoch: [{}]'.format(epoch)
     print_freq = 50
-    step_size = 100
-    warmup_iterations = warmup_steps*step_size  
+    lr_decay = config['lowlr']
+    total_step = epoch * len(data_loader)
     
     for i,(image, text, idx, extra_entail) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         image = image.to(device,non_blocking=True)   
         idx = idx.to(device,non_blocking=True)   
-        text_input_origin = tokenizer(text, padding='longest', max_length=30, return_tensors="pt").to(device)  
-        text_input_entail = tokenizer(extra_entail, padding='longest', max_length=30, return_tensors="pt").to(device)  
+        text_input_origin = tokenizer(text, padding='longest', max_length=50, return_tensors="pt").to(device)  
+        text_input_entail = tokenizer(extra_entail, padding='longest', max_length=50, return_tensors="pt").to(device)  
 
         if epoch>0 or not config['warm_up']:
             alpha = config['alpha']
@@ -62,23 +63,26 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
         loss_origin.backward()
         optimizer.step()  
 
-        loss_ita, loss_itm = model(image, text_input_entail,alpha=alpha, idx=idx)                  
-        loss_entail = loss_ita + loss_itm
-        
-        lr_decay = 0.3
         origin_lr = optimizer.param_groups[0]['lr']
-        modi_opt(optimizer,lr_decay)
+        metric_logger.update(lr=origin_lr)
 
-        optimizer.zero_grad()
-        loss_entail.backward()
-        optimizer.step()    
+        # 使用低学习率蕴含
+        if lr_decay > 0:
+            loss_ita, loss_itm = model(image, text_input_entail,alpha=alpha, idx=idx)                  
+            loss_entail = loss_ita + loss_itm
+            modi_opt(optimizer,lr_decay)
+            optimizer.zero_grad()
+            loss_entail.backward()
+            optimizer.step()    
+        else:
+            loss_entail = 0
         
-        metric_logger.update(loss_origin=loss_origin.item())
-        metric_logger.update(loss_entail=loss_entail.item())
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-        restore_opt(optimizer,origin_lr)
-        if epoch==0 and i%step_size==0 and i<=warmup_iterations: 
-            scheduler.step(i//step_size)         
+        metric_logger.update(loss_origin=loss_origin)
+        metric_logger.update(loss_entail=loss_entail)
+        metric_logger.update(lr_low=optimizer.param_groups[0]["lr"])
+        reset_opt(optimizer, origin_lr)
+
+        scheduler.step(total_step+i)      
         
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -99,7 +103,8 @@ def evaluation(model, data_loader, tokenizer, device, config):
     start_time = time.time()  
 
     texts = data_loader.dataset.text
-    origin_texts=data_loader.dataset.origin_text
+    images = data_loader.dataset.image
+    img2txt = data_loader.dataset.img2txt
     txt2img = data_loader.dataset.txt2img
     num_text = len(texts)
     text_bs = 256
@@ -109,7 +114,7 @@ def evaluation(model, data_loader, tokenizer, device, config):
     
     for i in range(0, num_text, text_bs):
         text = texts[i: min(num_text, i+text_bs)]
-        text_input = tokenizer(text, padding='max_length', truncation=True, max_length=30, return_tensors="pt").to(device) 
+        text_input = tokenizer(text, padding='max_length', truncation=True, max_length=50, return_tensors="pt").to(device) 
         text_output = model.text_encoder(text_input.input_ids, attention_mask = text_input.attention_mask, mode='text')  
         text_feat = text_output.last_hidden_state
         text_embed = F.normalize(model.text_proj(text_feat[:,0,:]))
@@ -123,7 +128,7 @@ def evaluation(model, data_loader, tokenizer, device, config):
     image_feats = []
     image_embeds = []
     image_ids = []
-    img2txt = data_loader.dataset.img2txt
+
     for image, img_id in data_loader: 
         image = image.to(device) 
         image_feat = model.visual_encoder(image)        
@@ -146,7 +151,7 @@ def evaluation(model, data_loader, tokenizer, device, config):
     start = rank*step
     end = min(sims_matrix.size(0),start+step)
 
-    for i,sims in enumerate(metric_logger.log_every(sims_matrix[start:end], 50, header)): 
+    for i,sims in enumerate(metric_logger.log_every(sims_matrix[start:end], 100, header)): 
         topk_sim, topk_idx = sims.topk(k=config['k_test'], dim=0)
 
         encoder_output = image_feats[start+i].repeat(config['k_test'],1,1).to(device)
@@ -168,7 +173,7 @@ def evaluation(model, data_loader, tokenizer, device, config):
     start = rank*step
     end = min(sims_matrix.size(0),start+step)    
     
-    for i,sims in enumerate(metric_logger.log_every(sims_matrix[start:end], 50, header)): 
+    for i,sims in enumerate(metric_logger.log_every(sims_matrix[start:end], 100, header)): 
         
         topk_sim, topk_idx = sims.topk(k=config['k_test'], dim=0)
         encoder_output = image_feats[topk_idx].to(device)
@@ -204,32 +209,26 @@ def evaluation(model, data_loader, tokenizer, device, config):
         result[image_ids[img]] = contents
 
     topk_result = {}
+    origin_text = data_loader.dataset.origin_text
     for image_id, txt_ids in result.items():
-        topk_result[data_loader.dataset.image[image_id]] = {
-            "goldens": [origin_texts[txtid] for txtid in img2txt[image_id]], 
-            "topks": [origin_texts[txtid] for txtid in txt_ids]
+        topk_result[images[image_id]] = {
+            "goldens": [origin_text[txtid] for txtid in img2txt[image_id]], 
+            "topks": [origin_text[txtid] for txtid in txt_ids]
             }
     # Images->Text
-    pres = np.zeros((scores_i2t.shape[0], 10))
     ranks = np.zeros(scores_i2t.shape[0])
-    golden_total=0
     for index, score in enumerate(scores_i2t):
         inds = np.argsort(score)[::-1]
         # Score
         rank = 1e20
         goldens = img2txt[index]
-        golden_total+=len(goldens)
         for i in goldens:
             tmp = np.where(inds == i)[0][0]
             if tmp < rank:
                 rank = tmp
         ranks[index] = rank
-        pres[index] = np.cumsum(np.in1d(inds[:10], goldens))
 
     # Compute metrics
-
-    pr5 = 100.0 * np.sum(pres[:, 4]) / golden_total
-    pr10 = 100.0 * np.sum(pres[:, 9]) / golden_total
 
     tr1 = 100.0 * len(np.where(ranks < 1)[0]) / len(ranks)
     tr5 = 100.0 * len(np.where(ranks < 5)[0]) / len(ranks)
@@ -237,13 +236,16 @@ def evaluation(model, data_loader, tokenizer, device, config):
 
     # Text->Images 
     ranks = np.zeros(scores_t2i.shape[0])
-    for index,score in enumerate(scores_t2i):
+    for index, score in enumerate(scores_t2i):
         inds = np.argsort(score)[::-1]
-        copes = np.where(inds == txt2img[index])[0]
-        if len(copes) == 0:
-            ranks[index] = 0
-        else:
-            ranks[index] = copes[0]
+        # Score
+        rank = 1e20
+        goldens = txt2img[index]
+        for i in goldens:
+            tmp = np.where(inds == i)[0][0]
+            if tmp < rank:
+                rank = tmp
+        ranks[index] = rank
 
     # Compute metrics
     ir1 = 100.0 * len(np.where(ranks < 1)[0]) / len(ranks)
@@ -251,7 +253,6 @@ def evaluation(model, data_loader, tokenizer, device, config):
     ir10 = 100.0 * len(np.where(ranks < 10)[0]) / len(ranks)        
 
     tr_mean = (tr1 + tr5 + tr10) / 3
-    pr_mean = (pr5 + pr10)/2
     ir_mean = (ir1 + ir5 + ir10) / 3
     r_mean = (tr_mean + ir_mean) / 2
 
@@ -259,9 +260,6 @@ def evaluation(model, data_loader, tokenizer, device, config):
                    'txt_r5': tr5,
                    'txt_r10': tr10,
                    'txt_r_mean': tr_mean,
-                   'txt_pr5': pr5,
-                   'txt_pr10': pr10,
-                   'txt_pr_mean': pr_mean,
                    'img_r1': ir1,
                    'img_r5': ir5,
                    'img_r10': ir10,
@@ -277,6 +275,7 @@ def evaluation(model, data_loader, tokenizer, device, config):
 def main(args, config):
     utils.init_distributed_mode(args)    
     config['dist'] = args.distributed
+    config['lowlr'] = args.lowlr
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
@@ -288,7 +287,7 @@ def main(args, config):
 
     #### Dataset #### 
     print("Creating retrieval dataset")
-    train_dataset, val_dataset, test_dataset = create_dataset('re_entail', config)  
+    train_dataset, val_dataset, test_dataset = create_dataset('re_entail_lr_split', config)  
 
     if args.distributed:
         num_tasks = utils.get_world_size()
@@ -340,10 +339,10 @@ def main(args, config):
     arg_opt = utils.AttrDict(config['optimizer'])
     optimizer = create_optimizer(arg_opt, model)
     arg_sche = utils.AttrDict(config['schedular'])
-    lr_scheduler, _ = create_scheduler(arg_sche, optimizer)  
+    arg_sche.steps_per_epoch = len(train_loader)
+    lr_scheduler, _ = create_scheduler(arg_sche, optimizer) 
     
     max_epoch = config['schedular']['epochs']
-    warmup_steps = config['schedular']['warmup_epochs']
     best = 0
     best_epoch = 0
 
@@ -357,7 +356,7 @@ def main(args, config):
         if not args.evaluate:
             if args.distributed:
                 train_loader.sampler.set_epoch(epoch)
-            train_stats = train(model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config)  
+            train_stats = train(model, train_loader, optimizer, tokenizer, epoch, device, lr_scheduler, config)  
             
         val_result,val_topk = evaluation(model_without_ddp, val_loader, tokenizer, device, config)
         test_result,test_topk = evaluation(model_without_ddp, test_loader, tokenizer, device, config)
@@ -370,7 +369,7 @@ def main(args, config):
                              'epoch': epoch,
                             }
                 with open(os.path.join(args.output_dir, "log.txt"),"a") as f:
-                    f.write(json.dumps(log_stats) + "\n")     
+                    f.write(json.dumps(log_stats, ensure_ascii=False, indent=4) + "\n")   
             else:
                 log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                              **{f'val_{k}': v for k, v in val_result.items()},
@@ -378,7 +377,7 @@ def main(args, config):
                              'epoch': epoch,
                             }
                 with open(os.path.join(args.output_dir, "log.txt"),"a") as f:
-                    f.write(json.dumps(log_stats) + "\n")   
+                    f.write(json.dumps(log_stats, ensure_ascii=False, indent=4) + "\n")   
                 
                 save_obj = {
                         'model': model_without_ddp.state_dict(),
@@ -393,14 +392,16 @@ def main(args, config):
                     torch.save(save_obj, os.path.join(args.output_dir, 'checkpoint_best.pth'))  
                     best = val_result['r_mean']    
                     best_epoch = epoch
-                    with open(os.path.join(args.output_dir, "best_top{}_result.json".format(config['k_test'])), "w") as f:
+                    with open(os.path.join(args.output_dir, "top{}_result_{}_val.json".format(config['k_test'], best_epoch)), "w") as f:
+                        f.write(json.dumps(val_topk,ensure_ascii=False,indent=4))
+                    with open(os.path.join(args.output_dir, "top{}_result_{}_test.json".format(config['k_test'], best_epoch)), "w") as f:
                         f.write(json.dumps(test_topk,ensure_ascii=False,indent=4))
                     
         if args.evaluate: 
             break
            
-        lr_scheduler.step(epoch+warmup_steps+1)  
-        dist.barrier()     
+        if utils.is_dist_avail_and_initialized():
+            dist.barrier()     
         torch.cuda.empty_cache()
 
     total_time = time.time() - start_time
@@ -425,11 +426,10 @@ if __name__ == '__main__':
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     parser.add_argument('--distributed', default=True, type=bool)
     parser.add_argument('--eval_before_train', action='store_true')
+    parser.add_argument('--lowlr', default=0.3, type=float)
     args = parser.parse_args()
 
     config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
-    print(config)
-    print(args)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
         
     yaml.dump(config, open(os.path.join(args.output_dir, 'config.yaml'), 'w'))    

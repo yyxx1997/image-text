@@ -74,11 +74,12 @@ class ALBEF(nn.Module):
 
         self.gate_net = nn.Linear(2*self.text_encoder.config.hidden_size, 2)
 
-    def forward(self, image, text, hypo, targets=None, alpha=0, train=True):
+    def forward(self, image, text, hypo, targets=None, mode=0, alpha=0, train=True):
 
         if train:
-            targets_te = targets_ve = targets
-
+            targets_ve ,targets_te = targets.clone(),targets.clone()
+            targets_te[mode>=2] = -1
+            targets_ve[(mode == 1) + (mode == 3)] = -1
             image_embeds, attn = self.visual_encoder(image)
             image_atts = torch.ones(
                 image_embeds.size()[:-1], dtype=torch.long).to(image.device)
@@ -89,12 +90,12 @@ class ALBEF(nn.Module):
                                                 )
             te_hiddens = textual_entailment.last_hidden_state[:, 0, :]
             prediction_te = self.textual_cls_head(te_hiddens)
-            loss_te = F.cross_entropy(prediction_te, targets_te)
+            loss_te = F.cross_entropy(prediction_te, targets_te, ignore_index=-1)
 
             if self.mask_patch_rate:
                 attn_cls = attn[:,:,0].detach().sum(dim=1)
                 extra_augment = 4
-                entail_pos = torch.where(targets==1)[0][:extra_augment]
+                entail_pos = torch.where(targets_ve==1)[0][:extra_augment]
                 extra_image_embeds = image_embeds[entail_pos]
                 extra_attn = attn_cls[entail_pos]
                 _, wait_mask_pos = extra_attn.topk(k=int(attn_cls.size(-1)*self.mask_patch_rate))
@@ -148,10 +149,10 @@ class ALBEF(nn.Module):
                 loss_ve = (1-alpha)*F.cross_entropy(prediction_ve, targets) - alpha*torch.sum(
                     F.log_softmax(prediction_ve, dim=1)*F.softmax(prediction_m, dim=1), dim=1).mean()
             else:
-                loss_ve = F.cross_entropy(prediction_ve, targets_ve)
+                loss_ve = F.cross_entropy(prediction_ve, targets_ve, ignore_index=-1)
 
             
-            loss_joint = F.cross_entropy(prediction_joint, targets_ve)
+            loss_joint = F.cross_entropy(prediction_joint, targets_ve, ignore_index=-1)
 
             return loss_ve, loss_te, loss_joint
 
